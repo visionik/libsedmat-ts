@@ -1,6 +1,6 @@
 # libsedmat-ts
 
-Zero-dependency TypeScript library implementing **[SEDMAT](https://sedmat.org)** (*Sed-Expression-Driven Mark(up|down) Annotation & Transformation*, **v3.6 + v3.7 `@` container scopes**).
+Zero-dependency TypeScript library implementing **[SEDMAT](https://sedmat.org)** (*Sed-Expression-Driven Mark(up|down) Annotation & Transformation*, **v3.6 + v3.7 `@` container scopes**), extracted from `@voxio/sedmat` in [`deftai/voxio2`](https://github.com/deftai/voxio2) and aligned with the canonical `sedmat.org` specification.
 
 For full language syntax, flags, and container scope documentation, see **[sedmat.org](https://sedmat.org)** and [`visionik/sedmat`](https://github.com/visionik/sedmat).
 
@@ -17,62 +17,72 @@ Requires Node.js 22+ or Bun 1.1+. **Zero runtime dependencies.**
 ## Quick Start
 
 ```ts
-import { Executor, MemoryDocument, formatNumbered, selectSegment } from "@visionik/libsedmat";
+import {
+  executeSedmat,
+  inspectNumbered,
+  inspectStructure,
+  MemorySedmatBackend,
+} from "@visionik/libsedmat";
 
-const doc = new MemoryDocument(
-  "Draft Proposal",
-  "Critical warning in paragraph two",
-  "Temporary note to remove",
-);
+const backend = new MemorySedmatBackend([
+  "Project Plan",
+  "Intro paragraph with draft wording.",
+  "DRAFT: internal scratch note",
+  "Closing paragraph",
+]);
 
-const exec = new Executor(doc);
+// 1. Inspect with 1-based numbering (`structure` / `cat -N`)
+console.log(inspectStructure(backend));
+console.log(inspectNumbered(backend));
+
+// 2. Preview safely with dry-run
 const script = `
-1s/Draft/{h=1}Final/
-2s/warning/{b c=red}/
-$d
-$a/Appendix A/
+1s/.*/{h=t}/
+2s/draft/{c=green}final{b}/i
+3d
+$a/{h=2}Appendix/
 `;
+const preview = executeSedmat(backend, script, { dryRun: true });
+console.log(`Dry-run matched ${preview.matchCount} operations`);
 
-// Dry-run preview
-const preview = await exec.executeString(script, { dryRun: true });
-console.log(`Matched ${preview.totalMatches} operations`);
-
-// Apply mutations
-await exec.executeString(script);
-console.log(formatNumbered(selectSegment(doc.project())));
+// 3. Apply mutations
+executeSedmat(backend, script);
+console.log(inspectNumbered(backend));
 ```
 
 ## SEDMAT v3.7 Container Scopes (`@`)
 
-Supports slides, sheets, tabs, pages, and named regions (`title`, `sub`, `body`, `notes`, `header`, `footer`, `shape=N`):
+Implement `SedmatBackend.forScope(scope)` and `applyContainerOp(cmd, spans)` to target slides, sheets, tabs, pages, headers/footers, and named regions (`title`, `sub`, `body`, `notes`, `shape=N`):
 
 ```ts
-await exec.executeString(`
+import { parseSedmat } from "@visionik/libsedmat";
+
+const cmds = parseSedmat(`
 @1:{z=#0F172A transition=fade}
-@2:s/500ms/{b c=green}120ms/g
-@2:{notes="Highlight 120ms WebTransport benchmark"}
+@slide=2:title:s/.*/{c=navy}New Title/
+@2:notes:a/Pause for Q&A./
 @"Q4 Budget":s/USD/EUR/g
 @$a/{layout=two-col}Next Steps/
+@3{move=1}
 `);
 ```
 
 ## Implementing a Custom Backend
 
-Implement the `Backend` interface (`project`, `applyTextPlan`, `applyAddressMutations`, `applyTableCreate`, `applyTransliterate`, and optional `applyContainerOp`) to connect `libsedmat-ts` to OOXML (`.docx`/`.pptx`), Google Docs, ProseMirror/TipTap, or any rich document model. All offsets are native JS UTF-16 code units.
+Implement `SedmatBackend` (`listElements`, `replaceInElement`, `deleteElements`, `insertElements`, `transliterateElement`, plus optional `applyPositionalInsert`, `applyTableOp`, `applyImageOp`, `applyContainerFlags`, `forScope`, `applyContainerOp`). See [`src/memory.ts`](./src/memory.ts) for a complete reference backend.
 
 ## Guide for AI Agents
 
-- Inspect first via `project()` → `formatStructure(seg)` or `formatNumbered(seg)` to obtain exact 1-based element indices.
-- Validate scripts with `{ dryRun: true }` before mutating.
-- Honor `brace.noReset` (`{!0}`) for additive formatting vs. implicit reset default.
-- Conformance suite: `testdata/conformance/v3.6.json` (shared with `libsedmat-go`, `libsedmat-rs`, `libsedmat-py`, and `libsedmat-cpp`).
+- Inspect first via `inspectStructure(backend)` or `inspectNumbered(backend)` to get exact 1-based indices.
+- Validate scripts with `executeSedmat(backend, script, { dryRun: true })` before mutating.
+- Honor `flags.reset` (`{0}`) vs. `flags.noReset` (`{!0}`) for reset vs. additive formatting.
+- Named colors follow the canonical `sedmat.org` 18-color hex palette (`red` = `FF0000`, `green` = `00FF00`, etc.).
+- Conformance suite: `testdata/conformance/v3.6.json` (shared across Go, TS, Rust, Python, and C++).
 
 ## Development
 
 ```bash
-make check       # Run Node.js and Bun test suites
-npm run test:node
-bun test
+make check   # bun test (85 tests across 6 suites)
 ```
 
 ## License

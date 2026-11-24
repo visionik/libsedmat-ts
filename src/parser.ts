@@ -1,545 +1,760 @@
-import type {
-  Address,
-  Command,
-  ContainerScope,
-  ContainerType,
-  Expression,
-  Program,
-} from "./types.ts";
-import {
-  findMatchingBrace,
-  hasBraceFormatting,
-  mergeBraceSpans,
-  parseBraceExpression,
-  parseBraceReplacement,
-} from "./brace.ts";
-import {
-  detectBraceReference,
-  parseBraceTableReference,
-  parseTableCellReference,
-  parseTableReference,
-} from "./references.ts";
-
-const CONTAINER_TYPES = new Set<ContainerType>(["slide", "sheet", "tab", "page", "section"]);
-const REGION_RE = /^(title|sub|subtitle|body|notes|header|footer|shape=[1-9]\d*)$/i;
-
-export function parseAddress(raw: string): { address?: Address; rest: string } {
-  if (!raw) return { rest: raw };
-  const first = raw[0]!;
-  if (first !== "$" && (first < "0" || first > "9")) {
-    return { rest: raw };
-  }
-
-  let i = 0;
-  let start = 0;
-  if (raw[i] === "$") {
-    start = -1;
-    i++;
-  } else {
-    const startIdx = i;
-    while (i < raw.length && raw[i]! >= "0" && raw[i]! <= "9") i++;
-    start = Number.parseInt(raw.slice(startIdx, i), 10);
-    if (start < 1) {
-      throw new Error(`address must be >= 1, got ${start}`);
-    }
-  }
-
-  let hasRange = false;
-  let end = 0;
-  if (i < raw.length && raw[i] === ",") {
-    if (start === -1) {
-      throw new Error("'$' cannot be used as range start");
-    }
-    hasRange = true;
-    i++;
-    if (i >= raw.length) {
-      throw new Error("missing range end after ','");
-    }
-    if (raw[i] === "$") {
-      end = -1;
-      i++;
-    } else if (raw[i]! >= "0" && raw[i]! <= "9") {
-      const endIdx = i;
-      while (i < raw.length && raw[i]! >= "0" && raw[i]! <= "9") i++;
-      end = Number.parseInt(raw.slice(endIdx, i), 10);
-      if (end < 1) {
-        throw new Error(`address range end must be >= 1, got ${end}`);
-      }
-      if (end < start) {
-        throw new Error(`address range ${start},${end} is reversed`);
-      }
-    } else {
-      throw new Error(`invalid range end in address: ${raw}`);
-    }
-  }
-
-  const rest = raw.slice(i);
-  if (rest === "") {
-    throw new Error(`address without command: ${raw}`);
-  }
-  return {
-    address: { start, end, hasRange },
-    rest,
-  };
-}
-
 /**
- * Parses an optional SEDMAT v3.7 `@` container scope or container-op prefix.
- * Examples:
- * - `@3d`, `@2,4d`, `@$d`, `@$a/{layout=two-col}Next/`, `@3{move=1}`, `@2{dup}`
- * - `@2:s/old/new/g`, `@2,5:s/a/b/g`, `@*:s/DRAFT//g`
- * - `@Summary:3d`, `@"Q4 Budget":s/USD/EUR/g`
- * - `@slide=2:title:s/.* /New Title/`, `@header:s/DRAFT/FINAL/`
+ * SEDMAT v3.6 Expression & Program Parser.
+ *
+ * Supports:
+ * - Classic `sed` 1-based addressing: `N`, `N,M`, `$`, `N,$`, `/re/`, `/a/,/b/`, `!`
+ * - Strict v3.6 address validation (`$,N`, reversed ranges, `0`, address without command)
+ * - Commands: `s`, `d`, `a`, `i`, `c`, `y` (both addressed and pattern forms)
+ * - Flags: `g`, `i` (case-insensitive), `m` (multiline), positive integer `N` (nth occurrence)
+ * - Any ASCII punctuation delimiter (`/`, `#`, `|`, etc.) with `\` escaping
+ * - Positional insert patterns (`^$`, `^`, `$`)
+ * - Table (`{T=...}`, `|N|[...]`) and Image (`{img=...}`, `!(...)`) targets
+ *
+ * Spec: https://github.com/visionik/sedmat (v3.6)
  */
-export function parseContainerScope(raw: string): { container?: ContainerScope; rest: string } {
-  if (!raw.startsWith("@")) {
-    return { rest: raw };
-  }
-  let pos = 1;
-  if (pos >= raw.length) {
-    throw new Error("empty container scope '@'");
-  }
 
-  // Shorthand region without target: `@header:...` or `@footer:...`
-  const bareRegion = /^(header|footer):(.*)$/i.exec(raw.slice(pos));
-  if (bareRegion) {
-    return {
-      container: { region: bareRegion[1]!.toLowerCase(), containerOp: false },
-      rest: bareRegion[2]!,
-    };
-  }
+import { parseBraceFlags, parseReplacementSegments } from "./brace.js";
+import { parseImagePattern, parseTablePattern } from "./references.js";
+import {
+  ContainerTarget,
+  ContainerType,
+  PositionalPattern,
+  SedmatAddress,
+  SedmatAddressPoint,
+  SedmatCommand,
+  SedmatContainerScope,
+  SedmatParseError,
+  SedmatProgram,
+  TableSpec,
+} from "./types.js";
 
-  let containerType: ContainerType | undefined;
-  const typeMatch = /^([a-z]+)=/.exec(raw.slice(pos));
-  if (typeMatch && CONTAINER_TYPES.has(typeMatch[1] as ContainerType)) {
-    containerType = typeMatch[1] as ContainerType;
-    pos += typeMatch[0].length;
-  }
-
-  let address: Address | undefined;
-  let all = false;
-  let name: string | undefined;
-
-  if (raw[pos] === "*") {
-    all = true;
-    pos++;
-  } else if (raw[pos] === '"') {
-    const endQuote = raw.indexOf('"', pos + 1);
-    if (endQuote < 0) {
-      throw new Error(`unterminated quoted container name: ${raw}`);
-    }
-    name = raw.slice(pos + 1, endQuote);
-    pos = endQuote + 1;
-  } else if (raw[pos] === "$" || (raw[pos]! >= "0" && raw[pos]! <= "9")) {
-    // Parse numeric/dollar container address without requiring immediate command
-    const addrEnd = scanContainerAddress(raw, pos);
-    const addrStr = raw.slice(pos, addrEnd);
-    const parsed = parseAddress(`${addrStr}d`); // validate with dummy command
-    address = parsed.address;
-    pos = addrEnd;
-  } else {
-    const start = pos;
-    while (pos < raw.length && /[A-Za-z0-9_-]/.test(raw[pos]!)) pos++;
-    if (pos === start) {
-      throw new Error(`invalid container target in ${raw}`);
-    }
-    name = raw.slice(start, pos);
-  }
-
-  if (pos >= raw.length) {
-    throw new Error(`container scope without command: ${raw}`);
-  }
-
-  // Container-scoped edit (`@<target>:...` or `@<target>:<region>:...`)
-  if (raw[pos] === ":") {
-    pos++;
-    let region: string | undefined;
-    const colonIdx = raw.indexOf(":", pos);
-    if (colonIdx > pos) {
-      const candidate = raw.slice(pos, colonIdx);
-      if (REGION_RE.test(candidate)) {
-        region = candidate.toLowerCase();
-        pos = colonIdx + 1;
-      }
-    }
-    const rest = raw.slice(pos);
-    if (!rest) {
-      throw new Error(`container scope without command: ${raw}`);
-    }
-    return {
-      container: { containerType, address, all: all || undefined, name, region, containerOp: false },
-      rest,
-    };
-  }
-
-  // Container-level operation (`@3d`, `@$a/.../`, `@2i/.../`, `@3{move=1}`, `@2{dup}`)
-  const rest = raw.slice(pos);
-  if (rest[0] === "d" || rest[0] === "a" || rest[0] === "i" || rest[0] === "{") {
-    return {
-      container: { containerType, address, all: all || undefined, name, containerOp: true },
-      rest,
-    };
-  }
-
-  throw new Error(`invalid container scope syntax: ${raw}`);
-}
-
-function scanContainerAddress(raw: string, startPos: number): number {
-  let i = startPos;
-  if (raw[i] === "$") {
-    i++;
-  } else {
-    while (i < raw.length && raw[i]! >= "0" && raw[i]! <= "9") i++;
-  }
-  if (i < raw.length && raw[i] === ",") {
-    i++;
-    if (i < raw.length && raw[i] === "$") {
-      i++;
-    } else {
-      while (i < raw.length && raw[i]! >= "0" && raw[i]! <= "9") i++;
-    }
-  }
-  return i;
-}
-
-export function splitByDelimiter(value: string, delimiter: string): string[] {
-  const parts: string[] = [];
-  let current = "";
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i]!;
-    if (ch === "\\" && i + 1 < value.length) {
-      const next = value[i + 1]!;
-      if (next === delimiter) {
-        current += delimiter;
-        i++;
-        continue;
-      }
-      current += ch + next;
-      i++;
-      continue;
-    }
-    if (ch === delimiter) {
-      parts.push(current);
-      current = "";
-      continue;
-    }
-    current += ch;
-  }
-  parts.push(current);
-  return parts;
-}
-
-export function applyRegexFlags(pattern: string, flags: string): string {
-  let result = pattern;
-  if (flags.includes("i") && !result.startsWith("(?i)")) {
-    result = `(?i)${result}`;
-  }
-  if (flags.includes("m") && !result.startsWith("(?m)")) {
-    result = `(?m)${result}`;
-  }
-  return result;
-}
-
-export function nthFlag(flags: string): number {
-  const m = /(\d+)/.exec(flags);
-  if (!m) return 0;
-  const n = Number.parseInt(m[1]!, 10);
-  return n > 0 ? n : 0;
-}
+const REGION_ONLY_NAMES = new Set(["header", "footer", "title", "sub", "subtitle", "body", "notes"]);
 
 function isAlphanumeric(ch: string): boolean {
   return /^[A-Za-z0-9]$/.test(ch);
 }
 
-export function parseSubstitution(raw: string): Expression {
-  if (raw.length < 4 || raw[0] !== "s") {
-    throw new Error(`invalid substitution expression: ${raw}`);
-  }
-  const delim = raw[1]!;
-  if (isAlphanumeric(delim) || delim === "\\") {
-    throw new Error(`invalid substitution delimiter: ${delim}`);
-  }
-  const parts = splitByDelimiter(raw.slice(2), delim);
-  if (parts.length < 3 || parts.length > 4) {
-    throw new Error(`malformed substitution expression: ${raw}`);
-  }
-  const rawPattern = parts[0]!;
-  const replacement = parts[1]!;
-  const flags = parts[2] ?? "";
-
-  const pattern = applyRegexFlags(rawPattern, flags);
-  return {
-    command: "s",
-    pattern,
-    replacement,
-    global: flags.includes("g"),
-    nthMatch: nthFlag(flags),
-    flags,
-  };
-}
-
-export function parseDelete(raw: string, hasAddress: boolean): Expression {
-  if (raw === "d") {
-    if (!hasAddress) {
-      throw new Error("delete command 'd' requires a pattern or address");
-    }
-    return { command: "d", pattern: "", replacement: "", global: false, nthMatch: 0, flags: "" };
-  }
-  if (raw.length < 3 || raw[0] !== "d") {
-    throw new Error(`invalid delete expression: ${raw}`);
-  }
-  const delim = raw[1]!;
-  if (isAlphanumeric(delim) || delim === "\\") {
-    throw new Error(`invalid delete delimiter: ${delim}`);
-  }
-  const parts = splitByDelimiter(raw.slice(2), delim);
-  if (parts.length < 2) {
-    throw new Error(`malformed delete expression: ${raw}`);
-  }
-  const flags = parts[1] ?? "";
-  return {
-    command: "d",
-    pattern: applyRegexFlags(parts[0]!, flags),
-    replacement: "",
-    global: flags.includes("g"),
-    nthMatch: 0,
-    flags,
-  };
-}
-
-export function parseInsertAppend(raw: string, command: "a" | "i", hasAddress: boolean): Expression {
-  if (raw.length < 3 || raw[0] !== command) {
-    throw new Error(`invalid ${command} expression: ${raw}`);
-  }
-  const delim = raw[1]!;
-  if (isAlphanumeric(delim) || delim === "\\") {
-    throw new Error(`invalid ${command} delimiter: ${delim}`);
-  }
-  const parts = splitByDelimiter(raw.slice(2), delim);
-  if (hasAddress) {
-    if (parts.length < 2) {
-      throw new Error(`malformed addressed ${command} expression: ${raw}`);
-    }
-    return {
-      command,
-      pattern: "",
-      replacement: parts[0]!,
-      global: false,
-      nthMatch: 0,
-      flags: parts[1] ?? "",
-    };
-  }
-  if (parts.length < 3) {
-    throw new Error(`malformed ${command} expression: ${raw}`);
-  }
-  const flags = parts[2] ?? "";
-  return {
-    command,
-    pattern: applyRegexFlags(parts[0]!, flags),
-    replacement: parts[1]!,
-    global: flags.includes("g"),
-    nthMatch: 0,
-    flags,
-  };
-}
-
-export function parseTransliterate(raw: string): Expression {
-  if (raw.length < 4 || raw[0] !== "y") {
-    throw new Error(`invalid transliterate expression: ${raw}`);
-  }
-  const delim = raw[1]!;
-  if (isAlphanumeric(delim) || delim === "\\") {
-    throw new Error(`invalid transliterate delimiter: ${delim}`);
-  }
-  const parts = splitByDelimiter(raw.slice(2), delim);
-  if (parts.length < 3) {
-    throw new Error(`malformed transliterate expression: ${raw}`);
-  }
-  const src = [...parts[0]!];
-  const dst = [...parts[1]!];
-  if (src.length !== dst.length) {
-    throw new Error(`transliterate source length (${src.length}) != dest length (${dst.length})`);
-  }
-  return {
-    command: "y",
-    pattern: parts[0]!,
-    replacement: parts[1]!,
-    global: false,
-    nthMatch: 0,
-    flags: parts[2] ?? "",
-  };
-}
-
-export function parseExpression(raw: string): Expression {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    throw new Error("empty expression");
-  }
-
-  const { container, rest: afterContainer } = parseContainerScope(trimmed);
-
-  // Standalone brace expression under a container scope (`@1:{z=#0F172A}`, `@3{move=1}`, `@2{dup}`)
-  if (container && afterContainer.startsWith("{")) {
-    const closeIdx = findMatchingBrace(afterContainer, 0);
-    if (closeIdx !== afterContainer.length - 1) {
-      throw new Error(`malformed container brace expression: ${raw}`);
-    }
-    const brace = parseBraceExpression(afterContainer.slice(1, closeIdx));
-    return {
-      command: "brace",
-      pattern: "",
-      replacement: afterContainer,
-      global: false,
-      nthMatch: 0,
-      flags: "",
-      container,
-      brace,
-    };
-  }
-
-  let address: Address | undefined;
-  let body = afterContainer;
-  if (!container?.containerOp) {
-    const parsedAddr = parseAddress(afterContainer);
-    address = parsedAddr.address;
-    body = parsedAddr.rest;
-  }
-
-  const hasAddr = Boolean(address) || Boolean(container);
-  const cmd = body[0] as Command;
-  let expr: Expression;
-  switch (cmd) {
-    case "s":
-      expr = parseSubstitution(body);
-      break;
-    case "d":
-      expr = parseDelete(body, hasAddr);
-      break;
-    case "a":
-    case "i":
-      expr = parseInsertAppend(body, cmd, hasAddr);
-      break;
-    case "y":
-      expr = parseTransliterate(body);
-      break;
-    default:
-      throw new Error(`unsupported command in expression: ${raw}`);
-  }
-
-  if (address) expr.address = address;
-  if (container) expr.container = container;
-  return expr;
-}
-
-export function parse(raw: string): Program {
-  return { expressions: [parseExpression(raw)] };
-}
-
-export function enrich(program: Program): Program {
-  return {
-    expressions: program.expressions.map(enrichExpression),
-  };
-}
-
-function enrichExpression(expression: Expression): Expression {
-  if (expression.enriched || expression.command !== "s") {
-    return expression;
-  }
-  const expr: Expression = { ...expression, enriched: true };
-
-  if (!expr.cell) {
-    const cell = parseTableCellReference(expr.pattern);
-    if (cell) {
-      expr.cell = cell;
-      expr.pattern = cell.subpattern ?? "";
-    }
-  }
-
-  if (!expr.cell && expr.pattern.startsWith("{")) {
-    const detected = detectBraceReference(expr.pattern);
-    expr.pattern = detected.remaining;
-    if (detected.table) {
-      expr.table = detected.table;
-      if (detected.table.isCreate) {
-        expr.tableCreate = {
-          rows: detected.table.createRows ?? 0,
-          columns: detected.table.createCols ?? 0,
-          header: detected.table.hasHeader,
-        };
-      }
-    }
-    if (detected.image) {
-      expr.image = detected.image;
-    }
-  }
-
-  if (!expr.cell && !expr.table && !expr.image) {
-    const table = parseTableReference(expr.pattern);
-    if (table) {
-      expr.table = table;
-      expr.pattern = "";
-    }
-  }
-
-  if (hasBraceFormatting(expr.replacement)) {
-    const { cleaned, spans } = parseBraceReplacement(expr.replacement);
-    if (spans.length > 0) {
-      expr.replacement = cleaned;
-      expr.braceSpans = spans;
-      if (spans.length === 1 && spans[0]!.isGlobal) {
-        expr.brace = spans[0]!.expr;
+/**
+ * Read a delimited string starting after the opening delimiter, honoring `\<delim>` escapes.
+ * Returns the captured raw content and the index immediately AFTER the closing delimiter.
+ */
+function readDelimited(
+  src: string,
+  start: number,
+  delim: string,
+  contextLabel?: string,
+  hint?: string,
+): { value: string; nextPos: number } {
+  let out = "";
+  let i = start;
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === "\\" && i + 1 < src.length) {
+      const next = src[i + 1]!;
+      if (next === delim) {
+        out += delim;
       } else {
-        expr.brace = mergeBraceSpans(spans);
+        out += ch + next;
       }
-      if (expr.brace?.tableRef) {
-        try {
-          const t = parseBraceTableReference(expr.brace.tableRef);
-          if (t.isCreate) {
-            expr.tableCreate = {
-              rows: t.createRows ?? 0,
-              columns: t.createCols ?? 0,
-              header: t.hasHeader,
-            };
-            expr.brace = undefined;
-            expr.braceSpans = undefined;
-          }
-        } catch {
-          // Leave as-is if not a create spec
+      i += 2;
+      continue;
+    }
+    if (ch === delim) {
+      return { value: out, nextPos: i + 1 };
+    }
+    out += ch;
+    i++;
+  }
+  const msg = contextLabel
+    ? `Missing closing '${delim}' after ${contextLabel}`
+    : `Unterminated delimiter '${delim}'`;
+  throw new SedmatParseError(msg, Math.max(0, start - 1), {
+    length: Math.max(1, src.length - Math.max(0, start - 1)),
+    hint: hint ?? `Add a closing '${delim}' to finish this segment`,
+  });
+}
+
+function readAddressPoint(
+  src: string,
+  pos: number,
+): { point: SedmatAddressPoint; nextPos: number } | null {
+  const ch = src[pos];
+  if (!ch) return null;
+
+  if (ch === "$") {
+    return { point: { kind: "last" }, nextPos: pos + 1 };
+  }
+
+  if (ch >= "0" && ch <= "9") {
+    let end = pos;
+    while (end < src.length && src[end]! >= "0" && src[end]! <= "9") end++;
+    const index = Number.parseInt(src.slice(pos, end), 10);
+    if (!Number.isFinite(index) || index < 1) {
+      throw new SedmatParseError(`Invalid 1-based paragraph number "${src.slice(pos, end)}"`, pos);
+    }
+    return { point: { kind: "line", index }, nextPos: end };
+  }
+
+  if (ch === "/") {
+    const { value, nextPos } = readDelimited(src, pos + 1, "/");
+    let p = nextPos;
+    let ignoreCase = false;
+    if (src[p] === "I" || src[p] === "i") {
+      // Peek: only consume 'i' as regex flag if followed by comma, !, command, or whitespace
+      const after = src[p + 1];
+      if (!after || after === "," || after === "!" || /\s/.test(after) || /[sdayic]/.test(after)) {
+        ignoreCase = true;
+        p++;
+      }
+    }
+    return { point: { kind: "regex", pattern: value, ignoreCase }, nextPos: p };
+  }
+
+  return null;
+}
+
+function detectPositionalPattern(
+  pattern: string,
+  address: SedmatAddress | undefined,
+): PositionalPattern | undefined {
+  if (address) return undefined;
+  if (pattern === "^$") return "emptyDoc";
+  if (pattern === "^") return "startOfDoc";
+  if (pattern === "$") return "endOfDoc";
+  return undefined;
+}
+
+function readRegexFlags(
+  src: string,
+  pos: number,
+): { ignoreCase: boolean; multiline: boolean; nextPos: number } {
+  let ignoreCase = false;
+  let multiline = false;
+  let p = pos;
+  while (p < src.length) {
+    const fl = src[p]!;
+    if (fl === "i" || fl === "I") {
+      ignoreCase = true;
+      p++;
+    } else if (fl === "m") {
+      multiline = true;
+      p++;
+    } else {
+      break;
+    }
+  }
+  return { ignoreCase, multiline, nextPos: p };
+}
+
+function readAddressExpr(
+  src: string,
+  startPos: number,
+): { address: SedmatAddress; nextPos: number } | null {
+  let pos = startPos;
+  const len = src.length;
+  const firstAddr = readAddressPoint(src, pos);
+  if (!firstAddr) return null;
+  pos = firstAddr.nextPos;
+  let endPoint: SedmatAddressPoint | undefined;
+  while (pos < len && (src[pos] === " " || src[pos] === "\t")) pos++;
+  if (src[pos] === ",") {
+    if (firstAddr.point.kind === "last") {
+      throw new SedmatParseError(
+        "Invalid address: $ cannot be range start (use N,$ instead)",
+        startPos,
+      );
+    }
+    pos++;
+    while (pos < len && (src[pos] === " " || src[pos] === "\t")) pos++;
+    const secondAddr = readAddressPoint(src, pos);
+    if (!secondAddr) {
+      throw new SedmatParseError("Invalid address: range end must be a number, $, or /regex/", pos);
+    }
+    if (
+      firstAddr.point.kind === "line" &&
+      secondAddr.point.kind === "line" &&
+      secondAddr.point.index < firstAddr.point.index
+    ) {
+      throw new SedmatParseError(
+        `Invalid address: range end (${secondAddr.point.index}) < start (${firstAddr.point.index})`,
+        startPos,
+      );
+    }
+    endPoint = secondAddr.point;
+    pos = secondAddr.nextPos;
+  }
+  while (pos < len && (src[pos] === " " || src[pos] === "\t")) pos++;
+  let negate = false;
+  if (src[pos] === "!") {
+    negate = true;
+    pos++;
+  }
+  return {
+    address: { start: firstAddr.point, end: endPoint, negate: negate || undefined },
+    nextPos: pos,
+  };
+}
+
+function readBraceBlock(src: string, startPos: number): { body: string; nextPos: number } {
+  let j = startPos + 1;
+  let quote: '"' | "'" | null = null;
+  let depth = 1;
+  while (j < src.length) {
+    const ch = src[j]!;
+    if (quote) {
+      if (ch === "\\" && j + 1 < src.length) j += 2;
+      else if (ch === quote) {
+        quote = null;
+        j++;
+      } else j++;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      j++;
+    } else if (ch === "{") {
+      depth++;
+      j++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return { body: src.slice(startPos + 1, j), nextPos: j + 1 };
+      }
+      j++;
+    } else {
+      j++;
+    }
+  }
+  throw new SedmatParseError("Missing closing '}' for brace flags", startPos, {
+    length: Math.max(1, src.length - startPos),
+    hint: "Close flags with '}', e.g. {b c=red}",
+  });
+}
+
+/**
+ * Parse a `@...` container prefix (v3.7):
+ * - Scoped: `@2:`, `@2,5:`, `@*:`, `@Summary:`, `@"Q4 Budget":`, `@slide=2:`, `@2:title:`, `@2:notes:`, `@header:`
+ * - Unscoped container op (no trailing `:`): `@3d`, `@$a/.../`, `@2i/.../`, `@3{move=1}`, `@2{dup}`
+ */
+function readContainerPrefix(
+  src: string,
+  startPos: number,
+): { scope: SedmatContainerScope; hasColon: boolean; nextPos: number } {
+  let pos = startPos + 1; // skip '@'
+  const len = src.length;
+  if (pos >= len) {
+    throw new SedmatParseError("Expected container target after '@'", startPos, {
+      hint: "Examples: @2:s/old/new/, @*:s/old/new/g, @2:title:s/.*/New/, @header:s/.../",
+    });
+  }
+
+  let containerType: ContainerType | undefined;
+
+  // Check optional typed prefix: slide=, sheet=, tab=, page=, section=
+  const typeMatch = /^(slide|sheet|tab|page|section)=/i.exec(src.slice(pos));
+  if (typeMatch) {
+    containerType = typeMatch[1]!.toLowerCase() as ContainerType;
+    pos += typeMatch[0].length;
+  }
+
+  let target: ContainerTarget;
+  let region: string | undefined;
+
+  const ch = src[pos];
+  if (!ch) {
+    throw new SedmatParseError("Expected container target after '@'", pos);
+  }
+
+  if (ch === "*") {
+    target = { kind: "all" };
+    pos++;
+  } else if (ch === '"' || ch === "'") {
+    const q = ch;
+    pos++;
+    let name = "";
+    while (pos < len && src[pos] !== q) {
+      if (src[pos] === "\\" && pos + 1 < len) {
+        name += src[pos + 1]!;
+        pos += 2;
+      } else {
+        name += src[pos]!;
+        pos++;
+      }
+    }
+    if (src[pos] !== q) {
+      throw new SedmatParseError("Unterminated quoted container name", startPos);
+    }
+    pos++;
+    target = { kind: "name", name };
+  } else if (ch === "$" || (ch >= "0" && ch <= "9")) {
+    const addr = readAddressExpr(src, pos);
+    if (!addr) {
+      throw new SedmatParseError("Invalid container address after '@'", pos);
+    }
+    target = { kind: "address", address: addr.address };
+    pos = addr.nextPos;
+  } else if (/[A-Za-z_]/.test(ch)) {
+    let end = pos;
+    while (end < len && /[A-Za-z0-9_-]/.test(src[end]!)) end++;
+    const ident = src.slice(pos, end);
+    pos = end;
+    if (!containerType && REGION_ONLY_NAMES.has(ident.toLowerCase()) && src[pos] === ":") {
+      target = { kind: "regionOnly" };
+      region = ident.toLowerCase();
+    } else {
+      target = { kind: "name", name: ident };
+    }
+  } else {
+    throw new SedmatParseError(`Unexpected character '${ch}' in '@' container scope`, pos);
+  }
+
+  let hasColon = false;
+  if (src[pos] === ":") {
+    hasColon = true;
+    pos++;
+    // Optional sub-region before a second `:` (e.g. `@2:title:...`, `@2:notes:...`, `@2:shape=2:...`)
+    if (!region) {
+      const regMatch = /^([A-Za-z][A-Za-z0-9_-]*(?:=\d+)?):/.exec(src.slice(pos));
+      if (regMatch) {
+        const candidate = regMatch[1]!.toLowerCase();
+        // Do not swallow single-letter commands like `s:` (if user used `:` as delimiter)
+        if (candidate.length > 1) {
+          region = candidate;
+          pos += regMatch[0].length;
         }
       }
     }
   }
 
-  return expr;
+  return {
+    scope: { containerType, target, region },
+    hasColon,
+    nextPos: pos,
+  };
 }
 
-export function parseProgram(script: string): Program {
-  const expressions: Expression[] = [];
-  const lines = script.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!.trim();
-    if (!line || line.startsWith("#")) continue;
-    try {
-      expressions.push(parseExpression(line));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`line ${i + 1}: ${msg}`);
-    }
-  }
-  return enrich({ expressions });
+/**
+ * Parse a standalone container scope string (e.g. `"@2"`, `"@2,5"`, `"@Summary"`, `"@slide=2:notes"`).
+ * Useful for CLI flags (`--slide`, `--tab`, `--sheet`) and tool `scope` options.
+ */
+export function parseContainerScope(raw: string): SedmatContainerScope {
+  const trimmed = raw.trim();
+  const normalized = trimmed.startsWith("@") ? trimmed : `@${trimmed}`;
+  const withColon = normalized.endsWith(":") ? normalized : `${normalized}:`;
+  const parsed = readContainerPrefix(withColon, 0);
+  return parsed.scope;
 }
 
-export function parseExpressions(rawExprs: string[]): Program {
-  const expressions: Expression[] = [];
-  for (let i = 0; i < rawExprs.length; i++) {
-    const line = rawExprs[i]!.trim();
-    if (!line || line.startsWith("#")) continue;
-    try {
-      expressions.push(parseExpression(line));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`expression ${i + 1}: ${msg}`);
+/**
+ * Parse one or more SEDMAT v3.7 commands separated by `;` or newlines.
+ * Lines starting with `#` are treated as comments.
+ */
+export function parseSedmat(script: string): SedmatCommand[] {
+  const commands: SedmatCommand[] = [];
+  const len = script.length;
+  let pos = 0;
+
+  const skipWsAndSep = (): void => {
+    while (pos < len) {
+      const ch = script[pos]!;
+      if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n" || ch === ";") {
+        pos++;
+      } else if (ch === "#") {
+        while (pos < len && script[pos] !== "\n") pos++;
+      } else {
+        break;
+      }
+    }
+  };
+
+  while (pos < len) {
+    skipWsAndSep();
+    if (pos >= len) break;
+
+    // 0. Optional `@` generic container scope / container-level op (SEDMAT v3.7)
+    let scope: SedmatContainerScope | undefined;
+    if (script[pos] === "@") {
+      const parsedScope = readContainerPrefix(script, pos);
+      scope = parsedScope.scope;
+      pos = parsedScope.nextPos;
+
+      // Container-level direct op (no `:`): `@3d`, `@$a/.../`, `@2i/.../`, `@3{move=1}`, `@2{dup}`
+      if (!parsedScope.hasColon) {
+        const opChar = script[pos];
+        if (!opChar || opChar === ";" || opChar === "\n" || opChar === "\r") {
+          throw new SedmatParseError("Container scope without command", pos, {
+            hint: "Add ':' for scoped edits (e.g. @2:s/old/new/) or a container op (d, a/…/, {dup}, {move=1})",
+          });
+        }
+        if (opChar === "d") {
+          pos++;
+          commands.push({ type: "container", scope, op: "delete" });
+          continue;
+        }
+        if (opChar === "a" || opChar === "i") {
+          const op = opChar === "a" ? "append" : "insert";
+          pos++;
+          const delim = script[pos];
+          if (!delim || /\s/.test(delim) || isAlphanumeric(delim)) {
+            throw new SedmatParseError(`Expected delimiter after '@...${opChar}'`, pos);
+          }
+          pos++;
+          const payload = readDelimited(script, pos, delim);
+          pos = payload.nextPos;
+          commands.push({
+            type: "container",
+            scope,
+            op,
+            text: payload.value,
+            segments: parseReplacementSegments(payload.value),
+          });
+          continue;
+        }
+        if (opChar === "{") {
+          const brace = readBraceBlock(script, pos);
+          pos = brace.nextPos;
+          commands.push({
+            type: "container",
+            scope,
+            op: "style",
+            flags: parseBraceFlags(brace.body),
+          });
+          continue;
+        }
+        throw new SedmatParseError(
+          `Expected ':', 'd', 'a', 'i', or '{...}' after '@' container scope`,
+          pos,
+          { hint: "Use ':' before commands (e.g. @2:s/old/new/) or {dup} / {move=1} / d directly" },
+        );
+      }
+
+      // After `@scope:`, allow direct container brace styling (`@1:{z=#0F172A}`, `@2:{notes="..."}`)
+      // OR shorthand `@2:{T=1!A1}/value/` when `{...}` is immediately followed by a delimiter
+      while (pos < len && (script[pos] === " " || script[pos] === "\t")) pos++;
+      if (script[pos] === "{") {
+        const brace = readBraceBlock(script, pos);
+        const after = script[brace.nextPos];
+        if (after && !/\s/.test(after) && after !== ";" && !isAlphanumeric(after)) {
+          // Shorthand `@2:{T=1!A1}/replacement/[flags]` -> synthesize substitute command
+          const patVal = `{${brace.body}}`;
+          const delim = after;
+          const rep = readDelimited(script, brace.nextPos + 1, delim);
+          pos = rep.nextPos;
+          const segments = parseReplacementSegments(rep.value);
+          commands.push({
+            type: "substitute",
+            scope,
+            pattern: patVal,
+            replacement: rep.value,
+            segments,
+            global: false,
+            ignoreCase: false,
+            multiline: false,
+            tableTarget: parseTablePattern(patVal) ?? undefined,
+            imageTarget: parseImagePattern(patVal) ?? undefined,
+          });
+          continue;
+        }
+        pos = brace.nextPos;
+        commands.push({
+          type: "container",
+          scope,
+          op: "style",
+          flags: parseBraceFlags(brace.body),
+        });
+        continue;
+      }
+    }
+
+    // 1. Optional classic sed address: N | N,M | $ | N,$ | /re/ | /re1/,/re2/ + optional !
+    let address: SedmatAddress | undefined;
+    const addrParsed = readAddressExpr(script, pos);
+    if (addrParsed) {
+      address = addrParsed.address;
+      pos = addrParsed.nextPos;
+      while (pos < len && (script[pos] === " " || script[pos] === "\t")) pos++;
+    }
+
+    // 2. Command verb
+    const cmd = script[pos];
+    if (!cmd || cmd === ";" || cmd === "\n" || cmd === "\r") {
+      throw new SedmatParseError("Address without command", pos, {
+        hint: "Follow address with s/pat/rep/, d, a/text/, i/text/, or c/text/",
+      });
+    }
+    pos++;
+
+    switch (cmd) {
+      case "s": {
+        const delim = script[pos];
+        if (!delim || /\s/.test(delim) || isAlphanumeric(delim)) {
+          throw new SedmatParseError("Expected delimiter after 's'", pos, {
+            hint: "Use '/', '|', or '#' — e.g. s/old/new/g",
+          });
+        }
+        pos++;
+        const patStart = pos;
+        const pat = readDelimited(
+          script,
+          pos,
+          delim,
+          "search pattern",
+          `Continue with ${delim}replacement${delim} — e.g. s${delim}old${delim}new${delim}g`,
+        );
+        const rep = readDelimited(
+          script,
+          pat.nextPos,
+          delim,
+          "replacement",
+          `Add a closing '${delim}' (and optional flags g, i, m)`,
+        );
+        pos = rep.nextPos;
+
+        let global = false;
+        let ignoreCase = false;
+        let multiline = false;
+        let occurrence: number | undefined;
+        while (pos < len) {
+          const fl = script[pos]!;
+          if (fl === "g") {
+            global = true;
+            pos++;
+          } else if (fl === "i" || fl === "I") {
+            ignoreCase = true;
+            pos++;
+          } else if (fl === "m") {
+            multiline = true;
+            pos++;
+          } else if (fl >= "1" && fl <= "9") {
+            let numEnd = pos;
+            while (numEnd < len && script[numEnd]! >= "0" && script[numEnd]! <= "9") numEnd++;
+            occurrence = Number.parseInt(script.slice(pos, numEnd), 10);
+            pos = numEnd;
+          } else {
+            break;
+          }
+        }
+
+        const segments = parseReplacementSegments(rep.value);
+        const tableTarget = parseTablePattern(pat.value) ?? undefined;
+        const imageTarget = tableTarget ? undefined : (parseImagePattern(pat.value) ?? undefined);
+        const positional =
+          !tableTarget && !imageTarget ? detectPositionalPattern(pat.value, address) : undefined;
+
+        if (!tableTarget && !imageTarget && !positional && pat.value) {
+          try {
+            new RegExp(pat.value);
+          } catch (reErr) {
+            throw new SedmatParseError(
+              `Invalid regex pattern: ${reErr instanceof Error ? reErr.message : String(reErr)}`,
+              patStart,
+              {
+                length: Math.max(1, pat.value.length),
+                hint: "Escape special regex characters like [, (, *, +, ? with '\\'",
+              },
+            );
+          }
+        }
+
+        let tableCreate: Extract<TableSpec, { kind: "create" }> | undefined;
+        for (const seg of segments) {
+          if (seg.kind === "brace" && seg.flags?.table?.kind === "create") {
+            tableCreate = seg.flags.table;
+            break;
+          }
+        }
+
+        commands.push({
+          type: "substitute",
+          scope,
+          address,
+          pattern: pat.value,
+          replacement: rep.value,
+          segments,
+          global,
+          ignoreCase,
+          multiline,
+          occurrence,
+          positional,
+          tableTarget,
+          imageTarget,
+          tableCreate,
+        });
+        break;
+      }
+
+      case "d": {
+        // Supports `5d`, `3,7d`, `$d`, `/foo/d`, `3,7d/pattern/[im]`, AND `d/pattern/[im]`
+        const next = script[pos];
+        if (next && next !== ";" && next !== "\n" && next !== "\r" && !/\s/.test(next)) {
+          if (isAlphanumeric(next)) {
+            throw new SedmatParseError(`Expected delimiter after 'd', got '${next}'`, pos);
+          }
+          const delim = next;
+          pos++;
+          const pat = readDelimited(script, pos, delim);
+          if (pat.value === "") {
+            throw new SedmatParseError("Invalid delete command: empty pattern", pos);
+          }
+          const rflags = readRegexFlags(script, pat.nextPos);
+          pos = rflags.nextPos;
+          commands.push({
+            type: "delete",
+            scope,
+            address,
+            pattern: pat.value,
+            ignoreCase: rflags.ignoreCase || undefined,
+            multiline: rflags.multiline || undefined,
+          });
+        } else {
+          if (!address) {
+            throw new SedmatParseError("Invalid delete command (expected d/pattern/ or [addr]d)", pos);
+          }
+          commands.push({ type: "delete", scope, address });
+        }
+        break;
+      }
+
+      case "a":
+      case "i":
+      case "c": {
+        const type = cmd === "a" ? "append" : cmd === "i" ? "insert" : "change";
+        // Supports:
+        //   5a/Appended text/
+        //   @2:body:a/Appended text/  (region-scoped single-arg append/insert)
+        //   a/pattern/Appended text/[im]  (two delimited segments when no address/region)
+        //   5a\ Appended text (newline-terminated)
+        const delim = script[pos];
+        if (!delim) {
+          throw new SedmatParseError(`Expected delimiter after '${cmd}'`, pos);
+        }
+        if (delim === "\\" || delim === " ") {
+          pos++;
+          if (script[pos] === "\n") pos++;
+          const nl = script.indexOf("\n", pos);
+          const text = nl === -1 ? script.slice(pos) : script.slice(pos, nl);
+          pos = nl === -1 ? len : nl + 1;
+          commands.push({
+            type,
+            scope,
+            address,
+            text,
+            segments: parseReplacementSegments(text),
+          });
+        } else {
+          if (isAlphanumeric(delim)) {
+            throw new SedmatParseError(`Expected delimiter after '${cmd}', got '${delim}'`, pos);
+          }
+          pos++;
+          const first = readDelimited(script, pos, delim);
+          pos = first.nextPos;
+          // Two-segment pattern form (`a/pattern/text/[im]`) when unaddressed
+          if (
+            !address &&
+            pos < len &&
+            script[pos] !== ";" &&
+            script[pos] !== "\n" &&
+            script[pos] !== "\r" &&
+            !/\s/.test(script[pos]!)
+          ) {
+            const second = readDelimited(script, pos, delim);
+            const rflags = readRegexFlags(script, second.nextPos);
+            pos = rflags.nextPos;
+            commands.push({
+              type,
+              scope,
+              pattern: first.value,
+              ignoreCase: rflags.ignoreCase || undefined,
+              multiline: rflags.multiline || undefined,
+              text: second.value,
+              segments: parseReplacementSegments(second.value),
+            });
+          } else {
+            // Allow single-arg append/insert when either an address OR a container scope (e.g. `@2:notes:a/Pause/`) is present
+            if (!address && !scope && cmd !== "c") {
+              throw new SedmatParseError(
+                `Invalid ${cmd} command (expected ${cmd}/pattern/text/ or [addr]${cmd}/text/)`,
+                pos,
+              );
+            }
+            if (first.value === "" && (address || scope) && cmd !== "c") {
+              throw new SedmatParseError(
+                `Invalid addressed ${cmd} command (expected [addr]${cmd}/text/)`,
+                pos,
+              );
+            }
+            commands.push({
+              type,
+              scope,
+              address,
+              text: first.value,
+              segments: parseReplacementSegments(first.value),
+            });
+          }
+        }
+        break;
+      }
+
+      case "y": {
+        const delim = script[pos];
+        if (!delim || /\s/.test(delim) || isAlphanumeric(delim)) {
+          throw new SedmatParseError("Expected delimiter after 'y'", pos);
+        }
+        pos++;
+        const srcChars = readDelimited(script, pos, delim);
+        const dstChars = readDelimited(script, srcChars.nextPos, delim);
+        pos = dstChars.nextPos;
+        const srcRunes = [...srcChars.value];
+        const dstRunes = [...dstChars.value];
+        if (srcRunes.length === 0) {
+          throw new SedmatParseError("Transliterate: empty source", pos);
+        }
+        if (srcRunes.length !== dstRunes.length) {
+          throw new SedmatParseError(
+            `'y' command source (${srcRunes.length}) and destination (${dstRunes.length}) lengths must match`,
+            pos,
+          );
+        }
+        commands.push({
+          type: "transliterate",
+          scope,
+          address,
+          source: srcChars.value,
+          dest: dstChars.value,
+        });
+        break;
+      }
+
+      default: {
+        // Capture full unexpected word token so editors can underline the whole bad verb/flag
+        let badEnd = pos;
+        while (badEnd < len && /[A-Za-z0-9_-]/.test(script[badEnd]!)) badEnd++;
+        const badTok = script.slice(pos - 1, badEnd);
+        throw new SedmatParseError(`Unknown SEDMAT command '${badTok}'`, pos - 1, {
+          length: badTok.length,
+          hint: "Expected s/pat/rep/, d/pat/, a/text/, i/text/, c/text/, y/src/dst/, or @scope:",
+        });
+      }
     }
   }
-  return enrich({ expressions });
+
+  return commands;
+}
+
+/** Parse a SEDMAT script into a `SedmatProgram` (matching `libsedmat-go` terminology). */
+export function parseProgram(script: string): SedmatProgram {
+  return { commands: parseSedmat(script) };
+}
+
+/** Parse a single SEDMAT expression (throws if empty or contains multiple commands). */
+export function parseExpression(expr: string): SedmatCommand {
+  const cmds = parseSedmat(expr);
+  if (cmds.length === 0) {
+    throw new SedmatParseError("Empty expression", 0);
+  }
+  if (cmds.length > 1) {
+    throw new SedmatParseError(
+      `Expected single expression, found ${cmds.length} commands (use parseProgram/parseSedmat)`,
+      0,
+    );
+  }
+  return cmds[0]!;
 }

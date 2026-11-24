@@ -1,11 +1,6 @@
-.PHONY: check test test/node test/bun
+.PHONY: check test
 
-check: test/node test/bun
+check: test
 
-test: check
-
-test/node:
-	node --test test/conformance.test.ts
-
-test/bun:
+test:
 	bun test

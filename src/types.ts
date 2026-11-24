@@ -1,360 +1,382 @@
 /**
- * SEDMAT v3.6 / v3.7 AST, document projection, mutation plan, and backend types.
+ * SEDMAT v3.6 (Sed-Expression-Driven Mark(up|down) Annotation & Transformation)
+ * Target-agnostic AST, addressing, formatting, reference, and backend types.
+ *
+ * Designed as a zero-dependency standalone TypeScript library ready for
+ * extraction to `github.com/visionik/libsedmat-ts` alongside `visionik/libsedmat-go`.
+ *
+ * Spec: https://github.com/visionik/sedmat (v3.6)
  */
 
-export type Command = "s" | "d" | "a" | "i" | "y" | "brace";
+// ---------------------------------------------------------------------------
+// Paragraph / Element Addressing (SEDMAT v3.6)
+// ---------------------------------------------------------------------------
 
-export interface Address {
-  /** 1-based start index, or -1 for `$` (last element). */
-  start: number;
-  /** 1-based end index, -1 for `$`, or 0 when single address. */
-  end: number;
-  hasRange: boolean;
+/** Top-level addressable element kinds in document order (1-based). */
+export type AddressElementKind = "paragraph" | "table" | "toc";
+
+/** One numbered top-level document element for addressing & introspection. */
+export interface AddressElement {
+  /** 1-based ordinal index in document order (1..N) */
+  number: number;
+  kind: AddressElementKind;
+  text: string;
+  /** Optional backend-specific block/element identifier */
+  id?: string;
+  /** Optional style/heading descriptor (e.g. "Heading1", "Normal", "Title") */
+  style?: string;
+  /** Optional extra metadata tag (e.g. list marker, row/col counts) */
+  meta?: string;
 }
 
+export type SedmatAddressPoint =
+  | { kind: "line"; index: number } // 1-based element index
+  | { kind: "last" } // $
+  | { kind: "regex"; pattern: string; ignoreCase?: boolean };
+
+export interface SedmatAddress {
+  start: SedmatAddressPoint;
+  end?: SedmatAddressPoint;
+  negate?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Generic Container Scopes (`@` — SEDMAT v3.7)
+// ---------------------------------------------------------------------------
+
+/** Optional explicit container type assertion (`@slide=2:`, `@sheet=Budget:`, `@tab=Summary:`). */
 export type ContainerType = "slide" | "sheet" | "tab" | "page" | "section";
 
-export interface ContainerScope {
-  /** Optional explicit container type (`slide`, `sheet`, `tab`, `page`, `section`). */
+export type ContainerTarget =
+  | { kind: "all" } // @*
+  | { kind: "address"; address: SedmatAddress } // @2, @2,5, @$, @2,$
+  | { kind: "name"; name: string } // @"Summary", @Budget
+  | { kind: "regionOnly" }; // @header:, @footer:, @notes: (implicit active container)
+
+export interface SedmatContainerScope {
   containerType?: ContainerType;
-  /** Numeric address (`@2`, `@2,5`, `@$`) when targeting by index. */
-  address?: Address;
-  /** Wildcard (`@*`) targeting all containers. */
-  all?: boolean;
-  /** Named container (`@Summary`, `@"Q4 Budget"`). */
-  name?: string;
-  /** Optional named sub-region (`title`, `sub`, `subtitle`, `body`, `notes`, `header`, `footer`, `shape=N`). */
+  target: ContainerTarget;
+  /** Optional named sub-region: "title", "sub", "body", "notes", "header", "footer", "shape=2", etc. */
   region?: string;
-  /** True when the expression operates on the container itself (`@3d`, `@$a/.../`, `@3{move=1}`). */
-  containerOp: boolean;
 }
 
-export interface InlineSpan {
-  flag: string;
-  text: string;
+// ---------------------------------------------------------------------------
+// Table, Image, Break, Spacing, Chip, and Structural Specs (SEDMAT v3.1–v3.6)
+// ---------------------------------------------------------------------------
+
+export type HeadingStyle =
+  | "Normal"
+  | "Title"
+  | "Subtitle"
+  | "Heading1"
+  | "Heading2"
+  | "Heading3"
+  | "Heading4"
+  | "Heading5"
+  | "Heading6";
+
+export type TextAlignment = "left" | "center" | "right" | "justify";
+
+export type BreakKind = "hr" | "page" | "column" | "section";
+
+export type CheckboxState = "unchecked" | "checked";
+
+export interface ParagraphSpacing {
+  beforePt: number;
+  afterPt: number;
 }
 
-export interface BraceExpression {
-  // Boolean inline flags
+export interface TocSpec {
+  /** Optional max heading depth (e.g. `{toc=2}` => H1–H2 only) */
+  maxDepth?: number;
+}
+
+/** 1-based cell coordinate (0 or "*" represented via `wildcard: true`). */
+export interface TableCellCoord {
+  /** 1-based row index, or "*" for all rows */
+  row: number | "*";
+  /** 1-based column index, or "*" for all columns */
+  col: number | "*";
+}
+
+export type TableTargetIndex = number | "*"; // positive 1-based, negative from end (-1), or "*"
+
+export type TableSpec =
+  | {
+      kind: "create";
+      rows: number;
+      cols: number;
+      header: boolean;
+    }
+  | {
+      kind: "ref";
+      table: TableTargetIndex;
+    }
+  | {
+      kind: "cell";
+      table: TableTargetIndex;
+      cell: TableCellCoord;
+    }
+  | {
+      kind: "range";
+      table: TableTargetIndex;
+      from: { row: number; col: number };
+      to: { row: number; col: number };
+    }
+  | {
+      kind: "allCells";
+      table: TableTargetIndex;
+    }
+  | {
+      kind: "rowOp";
+      table: TableTargetIndex;
+      op: "insertBefore" | "append" | "delete";
+      /** 1-based row index for insertBefore/delete (negative allowed for delete) */
+      index?: number;
+    }
+  | {
+      kind: "colOp";
+      table: TableTargetIndex;
+      op: "insertBefore" | "append" | "delete";
+      /** 1-based col index for insertBefore/delete (negative allowed for delete) */
+      index?: number;
+    };
+
+export type ImageSpec =
+  | { kind: "index"; index: number } // 1, -1, etc.
+  | { kind: "all" } // *
+  | { kind: "url"; url: string } // https://...
+  | { kind: "regex"; pattern: string }; // alt-text regex
+
+export type ChipKind =
+  | "person"
+  | "date"
+  | "file"
+  | "place"
+  | "dropdown"
+  | "chart"
+  | "bookmark";
+
+export interface ChipUri {
+  kind: ChipKind;
+  value: string;
+  raw: string;
+}
+
+export type UriTarget =
+  | { kind: "url"; href: string }
+  | { kind: "bookmark"; name: string }
+  | { kind: "chip"; chip: ChipUri };
+
+// ---------------------------------------------------------------------------
+// Canonical Brace Syntax Flags (SEDMAT v3.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Formatting, structural, and object attributes parsed from a `{...}` SEDMAT brace block.
+ * `null` on a value flag represents an explicit bare-flag reset back to default (e.g. `{c}`, `{z}`, `{f}`).
+ */
+export interface SedmatFormatFlags {
+  // Run-level boolean flags
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
   strike?: boolean;
   code?: boolean;
-  sup?: boolean;
-  sub?: boolean;
+  superscript?: boolean;
+  subscript?: boolean;
   smallCaps?: boolean;
 
-  // Value flags
+  // Run-level value flags (null = bare-flag reset to default)
+  color?: string | null; // 6-char uppercase hex without '#'
+  bg?: string | null; // background / highlight 6-char uppercase hex without '#'
+  fontFamily?: string | null;
+  fontSizePt?: number | null;
+  url?: string | null; // raw URI string (standard URL, #bookmark, or chip://...)
+  uri?: UriTarget | null; // parsed URI / bookmark / chip target
+  opacity?: number | null; // 0..100
+  kerningPt?: number | null;
+  effect?: string | null;
+
+  // Replacement text override (`t=text` or inline `{b=text}`); undefined => implicit `$0`
   text?: string;
-  color?: string;
-  bg?: string;
-  font?: string;
-  size?: number;
-  url?: string;
-  heading?: string;
-  leading?: number;
-  align?: string;
-  opacity?: number;
-  indent?: number;
-  kerning?: number;
-  width?: number;
-  height?: number;
-  spacingSet?: boolean;
-  spacingAbove?: number;
-  spacingBelow?: number;
-  effect?: string;
-  cols?: number;
+  /** True when text came from inline scoping (`{b=text}`, `{^=2}`, `{,=2}`) */
+  inlineScoped?: boolean;
 
-  // Special flags
+  // Image dimensions (`x=` width, `y=` height)
+  width?: number | null;
+  height?: number | null;
+
+  // Paragraph-level flags
+  heading?: HeadingStyle | null;
+  align?: TextAlignment | null;
+  leadingPt?: number | null;
+  indentPt?: number | null;
+  spacing?: ParagraphSpacing | null;
+  checkbox?: CheckboxState | null;
+  list?: "bullet" | "ordered" | "none" | null;
+  quote?: boolean;
+
+  // Structural / container / object flags
+  /** `{0}` resets all run formatting before applying any co-occurring flags */
   reset?: boolean;
+  /** `{!0}` opts out of implicit formatting reset (additive mode) */
   noReset?: boolean;
-  hasBreak?: boolean;
-  breakKind?: string;
+  /** `{+}` (hr), `{+=p}` (page), `{+=c}` (column), `{+=s}` (section) */
+  break?: BreakKind;
+  /** `{cols=N}` section column count */
+  cols?: number | null;
+  /** `{toc}` / `{toc=N}` */
+  toc?: TocSpec;
+  /** `{"=comment text}` */
   comment?: string;
+  /** `{@=bookmarkName}` */
   bookmark?: string;
-  check?: boolean;
-  hasToc?: boolean;
-  toc?: number;
-  imgRef?: string;
-  tableRef?: string;
+  /** `{T=...}` table creation / reference / cell / row / col op */
+  table?: TableSpec;
+  /** `{img=...}` image reference / insertion */
+  image?: ImageSpec;
 
-  // v3.7 Slide & Shape container brace flags
+  // Slide / container / shape flags (SEDMAT v3.7)
   layout?: string;
-  zone?: string;
+  zone?: "left" | "right" | "top" | "bottom" | "center" | "footer";
   shape?: string;
-  fill?: string;
-  stroke?: string;
+  fill?: string | null;
+  stroke?: string | null;
   notes?: string;
-  transition?: string;
+  transition?: "none" | "fade" | "push" | "wipe";
   move?: number;
   dup?: boolean;
   hide?: boolean;
-
-  inlineSpans?: InlineSpan[];
+  /** Optional unit-aware geometry expressions (e.g. "1in", "40%", "320px") */
+  geomX?: string;
+  geomY?: string;
+  geomW?: string;
+  geomH?: string;
 }
 
-export interface BraceSpan {
-  start: number;
-  end: number;
-  isGlobal: boolean;
-  expr: BraceExpression;
-  raw?: string;
+export interface SedmatReplacementSegment {
+  kind: "text" | "brace";
+  text?: string;
+  flags?: SedmatFormatFlags;
 }
 
-export interface CellReference {
-  tableIndex: number;
-  row: number;
-  column: number;
-  subpattern?: string;
-  rowOperation?: string;
-  columnOperation?: string;
-  operationTarget?: number;
-  endRow?: number;
-  endColumn?: number;
+/**
+ * Resolved styled span produced after applying flexible brace placement rules
+ * (`{b}hello`, `hello{b}`, `{c=red}warning{b}`, standalone `{b}` => `$0`, `H{,=2}O`).
+ */
+export interface SedmatStyledSpan {
+  /** Text for this span (may contain `$0`, `$1`, `&` before backref expansion). */
+  text: string;
+  /** True when the span's text came implicitly from `$0` (standalone `{b}` with no explicit text). */
+  implicitMatchText?: boolean;
+  flags?: SedmatFormatFlags;
 }
 
-export interface TableReference {
-  tableIndex: number;
-  isCreate?: boolean;
-  createRows?: number;
-  createCols?: number;
-  hasHeader?: boolean;
-  row?: number;
-  col?: number;
-  hasRange?: boolean;
-  endRow?: number;
-  endCol?: number;
-  isAllCells?: boolean;
-  rowWild?: boolean;
-  colWild?: boolean;
-  rowOp?: string;
-  colOp?: string;
-}
+// ---------------------------------------------------------------------------
+// Commands & Program AST
+// ---------------------------------------------------------------------------
 
-export interface ImageReference {
-  byPosition?: boolean;
-  position?: number;
-  allImages?: boolean;
-  byAlt?: boolean;
-  pattern?: string;
-}
+/** Special document-level positional patterns for `s///`. */
+export type PositionalPattern = "emptyDoc" | "startOfDoc" | "endOfDoc";
 
-export interface ImageSpec {
-  url: string;
-  alt?: string;
-  width?: number;
-  height?: number;
-}
-
-export interface TableCreateSpec {
-  rows: number;
-  columns: number;
-  header?: boolean;
-  cells?: string[][];
-}
-
-export interface Expression {
-  command: Command;
+export interface SedmatSubstituteCmd {
+  type: "substitute";
+  scope?: SedmatContainerScope;
+  address?: SedmatAddress;
   pattern: string;
   replacement: string;
+  segments: SedmatReplacementSegment[];
   global: boolean;
-  nthMatch: number;
-  flags: string;
-  address?: Address;
-  container?: ContainerScope;
-
-  // Enriched semantic fields
-  cell?: CellReference;
-  table?: TableReference;
-  image?: ImageReference;
-  brace?: BraceExpression;
-  braceSpans?: BraceSpan[];
-  tableCreate?: TableCreateSpec;
-  enriched?: boolean;
+  ignoreCase: boolean;
+  multiline: boolean;
+  /** Optional 1-based Nth occurrence selector (when not global) */
+  occurrence?: number;
+  /** Populated when pattern is `^$`, `^`, or `$` (and no address prefix) */
+  positional?: PositionalPattern;
+  /** Populated when pattern targets a table `{T=...}` or legacy `|N|[...]` */
+  tableTarget?: TableSpec;
+  /** Populated when pattern targets an image `{img=...}` or legacy `!(...)` */
+  imageTarget?: ImageSpec;
+  /** Populated when replacement creates a table `{T=RxC[:header]}` */
+  tableCreate?: Extract<TableSpec, { kind: "create" }>;
 }
 
-export interface Program {
-  expressions: Expression[];
+export interface SedmatDeleteCmd {
+  type: "delete";
+  scope?: SedmatContainerScope;
+  address?: SedmatAddress;
+  /** Optional inline regex pattern (`d/pattern/[im]` or `N,Md/pattern/[im]`) */
+  pattern?: string;
+  ignoreCase?: boolean;
+  multiline?: boolean;
 }
 
-// --- Document Projection ---
-
-export type DocumentBlockKind = "paragraph" | "table" | "table_of_contents" | "section_break";
-
-export interface DocumentBlock {
-  kind: DocumentBlockKind;
-  startIndex: number;
-  endIndex: number;
-  itemIndex: number;
-}
-
-export interface DocumentTextRun {
+export interface SedmatInsertCmd {
+  type: "append" | "insert" | "change";
+  scope?: SedmatContainerScope;
+  address?: SedmatAddress;
+  /** Optional inline match pattern (`a/pattern/text/[im]` form when unaddressed) */
+  pattern?: string;
+  ignoreCase?: boolean;
+  multiline?: boolean;
   text: string;
-  startIndex: number;
-  endIndex: number;
+  segments: SedmatReplacementSegment[];
 }
 
-export interface DocumentParagraph {
-  text: string;
-  startIndex: number;
-  endIndex: number;
-  namedStyle?: string;
-  bulletListId?: string;
-  bulletNestingLevel?: number;
-  leadingTab?: boolean;
+export interface SedmatTransliterateCmd {
+  type: "transliterate";
+  scope?: SedmatContainerScope;
+  address?: SedmatAddress;
+  source: string;
+  dest: string;
 }
 
-export interface DocumentTableCell {
-  text: string;
-  startIndex: number;
-  endIndex: number;
-  textStartIndex: number;
-  textEndIndex: number;
-  rowSpan?: number;
-  columnSpan?: number;
+/** Container-level structural or styling command (`@3d`, `@$a/.../`, `@3{move=1}`, `@1:{z=#0F172A}`). */
+export interface SedmatContainerCmd {
+  type: "container";
+  scope: SedmatContainerScope;
+  op: "delete" | "append" | "insert" | "style";
+  text?: string;
+  segments?: SedmatReplacementSegment[];
+  flags?: SedmatFormatFlags;
 }
 
-export interface DocumentTableRow {
-  startIndex: number;
-  endIndex: number;
-  cells: DocumentTableCell[];
+export type SedmatCommand =
+  | SedmatSubstituteCmd
+  | SedmatDeleteCmd
+  | SedmatInsertCmd
+  | SedmatTransliterateCmd
+  | SedmatContainerCmd;
+
+export interface SedmatProgram {
+  commands: SedmatCommand[];
 }
 
-export interface DocumentTable {
-  startIndex: number;
-  endIndex: number;
-  declaredRows: number;
-  declaredColumns: number;
-  rows: DocumentTableRow[];
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class SedmatParseError extends Error {
+  readonly offset: number;
+  readonly length: number;
+  readonly reason: string;
+  readonly hint?: string;
+  constructor(reason: string, offset = 0, options?: { length?: number; hint?: string }) {
+    super(
+      `SEDMAT parse error at offset ${offset}: ${reason}${options?.hint ? ` — ${options.hint}` : ""}`,
+    );
+    this.name = "SedmatParseError";
+    this.offset = offset;
+    this.length = Math.max(1, options?.length ?? 1);
+    this.reason = reason;
+    this.hint = options?.hint;
+  }
 }
 
-export interface DocumentImage {
-  objectId: string;
-  index: number;
-  alt?: string;
-  isPositioned?: boolean;
-}
-
-export interface DocumentSegment {
-  tabId: string;
-  title: string;
-  bodyStartIndex: number;
-  bodyEndIndex: number;
-  blocks: DocumentBlock[];
-  textRuns: DocumentTextRun[];
-  paragraphs: DocumentParagraph[];
-  tables: DocumentTable[];
-  images: DocumentImage[];
-}
-
-export interface DocumentProjection {
-  documentId: string;
-  revisionId: string;
-  legacy?: DocumentSegment;
-  tabs: DocumentSegment[];
-}
-
-// --- Planning & Mutations ---
-
-export type AddressElementKind = "paragraph" | "table" | "toc";
-
-export interface AddressElement {
-  number: number;
-  kind: AddressElementKind;
-  text: string;
-  startIndex: number;
-  endIndex: number;
-}
-
-export interface AddressMutation {
-  startIndex: number;
-  endIndex: number;
-  insertText?: string;
-}
-
-export interface ImageMutation {
-  startIndex: number;
-  endIndex: number;
-  image: ImageSpec;
-}
-
-export interface FootnoteMutation {
-  startIndex: number;
-  endIndex: number;
-  text: string;
-}
-
-export interface TextEdit {
-  startIndex: number;
-  endIndex: number;
-  insertText: string;
-  horizontalRule?: boolean;
-}
-
-export interface FormatIntent {
-  startIndex: number;
-  endIndex: number;
-  structuralStartIndex: number;
-  structuralEndIndex: number;
-  formats: string[];
-  leadingTab?: boolean;
-  brace?: BraceExpression;
-  braceSpans?: BraceSpan[];
-}
-
-export interface TextPlan {
-  matchCount: number;
-  images: ImageMutation[];
-  footnotes: FootnoteMutation[];
-  textEdits: TextEdit[];
-  formatting: FormatIntent[];
-}
-
-export interface TableCreateMutation {
-  startIndex: number;
-  endIndex: number;
-  rows: number;
-  columns: number;
-}
-
-// --- Backend & Execution ---
-
-export interface DocumentIntrospector {
-  project(): Promise<DocumentProjection> | DocumentProjection;
-}
-
-export interface Backend extends DocumentIntrospector {
-  applyTextPlan(tabId: string, plan: TextPlan): Promise<void> | void;
-  applyAddressMutations(tabId: string, mutations: AddressMutation[]): Promise<void> | void;
-  applyTableCreate(tabId: string, mutation: TableCreateMutation, spec: TableCreateSpec): Promise<void> | void;
-  applyTransliterate(
-    tabId: string,
-    source: string,
-    dest: string,
-    targets: AddressElement[],
-  ): Promise<number> | number;
-  applyContainerOp?(scope: ContainerScope, expr: Expression): Promise<number> | number;
-}
-
-export interface ExecuteOptions {
-  dryRun?: boolean;
-  tabId?: string;
-}
-
-export interface ExpressionReport {
-  index: number;
-  command: Command;
-  matchCount: number;
-  textPlan?: TextPlan;
-  addressMutations?: AddressMutation[];
-  tableCreate?: TableCreateMutation;
-  dryRun: boolean;
-}
-
-export interface ExecutionReport {
-  dryRun: boolean;
-  tabId: string;
-  totalMatches: number;
-  expressions: ExpressionReport[];
+export class SedmatAddressError extends Error {
+  constructor(message: string) {
+    super(`SEDMAT address error: ${message}`);
+    this.name = "SedmatAddressError";
+  }
 }
