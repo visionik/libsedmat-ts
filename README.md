@@ -109,6 +109,23 @@ Implement `SedmatBackend` (`listElements`, `replaceInElement`, `deleteElements`,
 - Named colors follow the canonical `sedmat.org` 18-color hex palette (`red` = `FF0000`, `green` = `00FF00`, etc.).
 - Conformance suite: `testdata/conformance/v3.6.json` (shared across Go, TS, Rust, Python, and C++).
 
+## Examples
+
+All examples have **zero external dependencies** and run directly with Bun:
+
+- **[`examples/lsp-server`](./examples/lsp-server/server.ts)** — SEDMAT Language Server (LSP over stdio) with live diagnostics, profile-aware completions + color swatches, signature help, and semantic tokens:
+  ```bash
+  bun run examples/lsp-server/server.ts
+  ```
+- **[`examples/doc-playground`](./examples/doc-playground/server.ts)** — Launch-a-web Document Playground (`http://127.0.0.1:4173`) with live syntax highlighting, IntelliSense dropdown, color swatches, ghost text, dry-run preview, and numbered document view:
+  ```bash
+  bun run examples/doc-playground/server.ts
+  ```
+- **[`examples/slide-deck`](./examples/slide-deck/server.ts)** — Launch-a-web Slide Deck Studio (`http://127.0.0.1:4174`) demonstrating SEDMAT v3.7 `@` container scopes and Slides profile completions:
+  ```bash
+  bun run examples/slide-deck/server.ts
+  ```
+
 ## Development
 
 ```bash
