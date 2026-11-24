@@ -67,6 +67,36 @@ const cmds = parseSedmat(`
 `);
 ```
 
+## IntelliSense, Diagnostics & Syntax Tokenizer
+
+`libsedmat-ts` includes a UI-agnostic, zero-dependency IntelliSense engine for web command bars, TUIs, CLIs, and LSPs:
+
+```ts
+import {
+  extractSedmatDiagnostic,
+  getSedmatCompletions,
+  tokenizeSedmat,
+} from "@visionik/libsedmat";
+
+// 1. Cursor-aware completions with capability profiles & host extensions
+const res = getSedmatCompletions("s/foo/{c=re", 11, {
+  mode: "slides",
+  activeContainer: 2,
+});
+// res.suggestions[0] => { label: "red", swatch: "#FF0000", ... }
+// res.ghostSuffix    => "d"
+
+// 2. Non-throwing syntax tokenizer for highlighting
+const tokens = tokenizeSedmat("@2:title:s/foo/{b c=red}bar/gi");
+
+// 3. Structured diagnostics from any thrown SEDMAT error
+try {
+  // parseSedmat(...)
+} catch (err) {
+  const diag = extractSedmatDiagnostic(err); // { ok, summary, errorOffset, errorLength, hint }
+}
+```
+
 ## Implementing a Custom Backend
 
 Implement `SedmatBackend` (`listElements`, `replaceInElement`, `deleteElements`, `insertElements`, `transliterateElement`, plus optional `applyPositionalInsert`, `applyTableOp`, `applyImageOp`, `applyContainerFlags`, `forScope`, `applyContainerOp`). See [`src/memory.ts`](./src/memory.ts) for a complete reference backend.
@@ -82,8 +112,14 @@ Implement `SedmatBackend` (`listElements`, `replaceInElement`, `deleteElements`,
 ## Development
 
 ```bash
-make check   # bun test (85 tests across 6 suites)
+make check   # bun test (90 tests across 7 suites)
 ```
+
+## Related
+
+- **SEDMAT Website & Docs**: [https://sedmat.org](https://sedmat.org)
+- **SEDMAT Specification**: [https://github.com/visionik/sedmat](https://github.com/visionik/sedmat)
+- **Sibling Libraries**: [`libsedmat-go`](https://github.com/visionik/libsedmat-go) · [`libsedmat-rs`](https://github.com/visionik/libsedmat-rs) · [`libsedmat-py`](https://github.com/visionik/libsedmat-py) · [`libsedmat-cpp`](https://github.com/visionik/libsedmat-cpp)
 
 ## License
 
