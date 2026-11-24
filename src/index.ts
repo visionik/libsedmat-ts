@@ -13,3 +13,4 @@ export * from "./address.js";
 export * from "./parser.js";
 export * from "./backend.js";
 export * from "./memory.js";
+export * from "./intellisense.js";

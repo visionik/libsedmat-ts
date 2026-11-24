@@ -8,7 +8,8 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./memory": "./src/memory.ts"
+    "./memory": "./src/memory.ts",
+    "./intellisense": "./src/intellisense.ts"
   },
   "scripts": {
     "test": "bun test",
